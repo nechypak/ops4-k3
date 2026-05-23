@@ -1,0 +1,10 @@
+aws_region: us-east-1
+backup_bucket_name: ops4-minecraft-backup-kn
+backup_prefix: minecraft/world-data
+minecraft_host_data_dir: /data/minecraft
+kubeconfig: /etc/rancher/k3s/k3s.yaml
+namespace: minecraft
+
+# Paste after terraform/foundation apply.
+ecr_repository_url: "PASTE_ECR_REPOSITORY_URL"
+ecr_registry: "PASTE_ECR_REGISTRY_ONLY"

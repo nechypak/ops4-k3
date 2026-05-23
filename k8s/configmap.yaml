@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minecraft-config
+  namespace: minecraft
+data:
+  EULA: "TRUE"
+  TYPE: "PAPER"
+  VERSION: "1.21.11"
+  MEMORY: "2G"
+  MOTD: "Kanstantsin Nechyparenka, nechypak@oregonstate.edu"
+  ENABLE_RCON: "true"
+  RCON_PASSWORD: "change-me-for-lab"

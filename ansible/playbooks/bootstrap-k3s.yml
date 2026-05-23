@@ -1,0 +1,209 @@
+---
+- name: Bootstrap single-node k3s for Ops 4 Minecraft
+  hosts: minecraft
+  become: true
+
+  tasks:
+    - name: Install base packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - awscli
+          - jq
+          - tar
+        state: present
+        update_cache: true
+
+    - name: Verify AWS instance profile works on host
+      command: aws sts get-caller-identity --region {{ aws_region }}
+      changed_when: false
+
+    - name: Create host data directory for Kubernetes PV
+      file:
+        path: "{{ minecraft_host_data_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0777"
+
+    - name: Check if backup tar exists in S3
+      command: >
+        aws s3 ls s3://{{ backup_bucket_name }}/{{ backup_prefix }}/world.tar
+        --region {{ aws_region }}
+      register: backup_check
+      failed_when: false
+      changed_when: false
+
+    - name: Restore host PV data from S3 before Kubernetes starts Minecraft
+      shell: |
+        set -euo pipefail
+        aws s3 cp "s3://{{ backup_bucket_name }}/{{ backup_prefix }}/world.tar" /tmp/world.tar --region "{{ aws_region }}"
+        tar -xf /tmp/world.tar -C "{{ minecraft_host_data_dir }}"
+        rm -f /tmp/world.tar
+      args:
+        executable: /bin/bash
+      when: backup_check.rc == 0
+
+    - name: Install k3s if missing
+      shell: |
+        set -euo pipefail
+        if ! command -v k3s >/dev/null 2>&1; then
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik" sh -
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Wait for Kubernetes API
+      command: kubectl --kubeconfig {{ kubeconfig }} get nodes
+      register: kube_nodes
+      retries: 30
+      delay: 5
+      until: kube_nodes.rc == 0
+      changed_when: false
+
+    - name: Make kubeconfig readable by ubuntu user
+      file:
+        path: "{{ kubeconfig }}"
+        mode: "0644"
+
+    - name: Install ECR pull secret refresh script
+      copy:
+        dest: /usr/local/bin/refresh-ecr-secret.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          AWS_REGION="{{ aws_region }}"
+          NAMESPACE="{{ namespace }}"
+          ECR_REGISTRY="{{ ecr_registry }}"
+          KUBECONFIG="{{ kubeconfig }}"
+
+          kubectl --kubeconfig "$KUBECONFIG" create namespace "$NAMESPACE" \
+            --dry-run=client -o yaml | kubectl --kubeconfig "$KUBECONFIG" apply -f -
+
+          PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
+
+          kubectl --kubeconfig "$KUBECONFIG" -n "$NAMESPACE" create secret docker-registry ecr-pull-secret \
+            --docker-server="$ECR_REGISTRY" \
+            --docker-username=AWS \
+            --docker-password="$PASSWORD" \
+            --dry-run=client -o yaml | kubectl --kubeconfig "$KUBECONFIG" apply -f -
+
+    - name: Run ECR pull secret refresh now
+      command: /usr/local/bin/refresh-ecr-secret.sh
+      changed_when: false
+
+    - name: Install systemd service for ECR pull secret refresh
+      copy:
+        dest: /etc/systemd/system/ecr-secret-refresh.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Refresh Kubernetes ECR imagePullSecret
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/refresh-ecr-secret.sh
+
+    - name: Install systemd timer for ECR pull secret refresh
+      copy:
+        dest: /etc/systemd/system/ecr-secret-refresh.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Refresh Kubernetes ECR imagePullSecret every 6 hours
+
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=6h
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Install Minecraft backup script
+      copy:
+        dest: /usr/local/bin/minecraft-k8s-backup.sh
+        owner: root
+        group: root
+        mode: "0755"
+        content: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          KUBECONFIG="{{ kubeconfig }}"
+          NAMESPACE="{{ namespace }}"
+          DATA_DIR="{{ minecraft_host_data_dir }}"
+          S3_URI="s3://{{ backup_bucket_name }}/{{ backup_prefix }}/world.tar"
+          REGION="{{ aws_region }}"
+
+          POD="$(kubectl --kubeconfig "$KUBECONFIG" -n "$NAMESPACE" get pods -l app=minecraft -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+          if [[ -n "$POD" ]]; then
+            kubectl --kubeconfig "$KUBECONFIG" -n "$NAMESPACE" exec "$POD" -- rcon-cli save-all flush || true
+            sleep 5
+          fi
+
+          tar -C "$DATA_DIR" -cf /tmp/world.tar .
+          aws s3 cp /tmp/world.tar "$S3_URI" --region "$REGION"
+          rm -f /tmp/world.tar
+          echo "Backed up $DATA_DIR to $S3_URI"
+
+    - name: Install backup service
+      copy:
+        dest: /etc/systemd/system/minecraft-k8s-backup.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Backup Kubernetes Minecraft world data to S3
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/minecraft-k8s-backup.sh
+
+    - name: Install hourly backup timer
+      copy:
+        dest: /etc/systemd/system/minecraft-k8s-backup.timer
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Run Minecraft Kubernetes S3 backup hourly
+
+          [Timer]
+          OnCalendar=hourly
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable timers
+      systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - ecr-secret-refresh.timer
+        - minecraft-k8s-backup.timer
+
+    - name: Show k3s node status
+      command: kubectl --kubeconfig {{ kubeconfig }} get nodes -o wide
+      changed_when: false
+      register: final_nodes
+
+    - name: Print node status
+      debug:
+        var: final_nodes.stdout_lines

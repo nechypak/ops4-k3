@@ -1,0 +1,2 @@
+[minecraft]
+ops4-k3s ansible_host=PASTE_TERRAFORM_PUBLIC_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/Downloads/cs312-key.pem
