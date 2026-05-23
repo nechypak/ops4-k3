@@ -1,0 +1,72 @@
+name: Publish Minecraft Image to ECR
+
+on:
+  push:
+    tags:
+      - "ops4-v*"
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ops4-k3-minecraft
+  UPSTREAM_IMAGE: itzg/minecraft-server:2026.5.2-java21
+
+jobs:
+  smoke-test-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials from AWS Academy secrets
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Pull pinned upstream Minecraft image
+        run: docker pull "$UPSTREAM_IMAGE"
+
+      - name: Smoke test Minecraft startup
+        run: |
+          set -euo pipefail
+
+          docker run -d --name mc-smoke \
+            -e EULA=TRUE \
+            -e TYPE=PAPER \
+            -e VERSION=1.21.11 \
+            -e MEMORY=1G \
+            "$UPSTREAM_IMAGE"
+
+          for i in $(seq 1 18); do
+            sleep 10
+            docker logs mc-smoke 2>&1 | tail -n 80
+            if docker logs mc-smoke 2>&1 | grep -q "Done ("; then
+              echo "Minecraft initialized successfully"
+              docker rm -f mc-smoke
+              exit 0
+            fi
+          done
+
+          echo "Smoke test failed"
+          docker logs mc-smoke
+          docker rm -f mc-smoke
+          exit 1
+
+      - name: Tag and push image to ECR
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          DESTINATION="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_REF_NAME}"
+
+          docker tag "$UPSTREAM_IMAGE" "$DESTINATION"
+          docker push "$DESTINATION"
+
+          echo "Published $DESTINATION"
